@@ -1029,7 +1029,7 @@
                             </div>
                             <button type="button" class="btn-primary" id="saveKeyBtn" style="padding: 0.5rem 1rem; flex-shrink: 0;">Save Key</button>
                         </div>
-                        <small id="keyStatus" style="color: var(--accent-color);">If the default key is rate-limited, you can paste your own key here to override it instantly!</small>
+                        <small id="keyStatus" style="color: var(--accent-color);">If the default key is rate-limited, paste your own key here (several keys from different Google projects can be pasted, separated by commas).</small>
                     </div>
                 </details>
             </section>
@@ -1799,7 +1799,7 @@
                         keyStatus.textContent = `✅ API Key loaded from saved preferences (${masked}).`;
                         keyStatus.style.color = "var(--accent-color)";
                     } else {
-                        keyStatus.textContent = "If the default key is rate-limited, you can paste your own key here to override it instantly!";
+                        keyStatus.textContent = "If the default key is rate-limited, paste your own key here (several keys from different Google projects can be pasted, separated by commas).";
                         keyStatus.style.color = "var(--text-secondary)";
                     }
                 } else {
@@ -2207,7 +2207,10 @@
                 if (addCameraInput) addCameraInput.value = '';
             }
 
+            let galleryObjectUrls = [];
             function renderGallery() {
+                galleryObjectUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch (e) {} });
+                galleryObjectUrls = [];
                 if (currentFiles.length === 0) {
                     uploadPlaceholder.classList.remove('hidden');
                     previewGallery.classList.add('hidden');
@@ -2233,6 +2236,7 @@
 
                     const img = document.createElement('img');
                     const objectUrl = URL.createObjectURL(file);
+                    galleryObjectUrls.push(objectUrl);
                     img.src = objectUrl;
 
                     const pageLabel = document.createElement('span');
@@ -2918,7 +2922,7 @@
                 // Re-download PDF
                 if (redownloadBtn) {
                     redownloadBtn.onclick = () => {
-                        const blobUrl = URL.createObjectURL(blob);
+                        const blobUrl = URL.createObjectURL(blob); setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
                         const a = document.createElement('a');
                         a.href = blobUrl;
                         a.download = filename;
@@ -3055,7 +3059,7 @@
 
                         // Fallback for desktop or browsers without file share support:
                         // Download PDF file directly to device Downloads folder
-                        const blobUrl = URL.createObjectURL(blob);
+                        const blobUrl = URL.createObjectURL(blob); setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
                         const downloadAnchor = document.createElement('a');
                         downloadAnchor.href = blobUrl;
                         downloadAnchor.download = filename;
@@ -3207,7 +3211,7 @@
                 try {
                     const blob = await generateSectionPdfBlob('📊 Structured Clinical Report', '#3b82f6', 'analysisResult', 'MediScan_Structured_Report.pdf');
                     const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a'); a.href = url; a.download = 'MediScan_Structured_Report.pdf'; a.click();
+                    const a = document.createElement('a'); a.href = url; a.download = 'MediScan_Structured_Report.pdf'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 60000);
                 } catch(e) { console.error(e); }
                 finally { btn.innerHTML = '⬇️ PDF'; btn.disabled = false; }
             });
@@ -3251,7 +3255,7 @@
                 try {
                     const blob = await generateSectionPdfBlob('📖 Clinical Care Narrative', '#10b981', 'storyResult', 'MediScan_Clinical_Story.pdf');
                     const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a'); a.href = url; a.download = 'MediScan_Clinical_Story.pdf'; a.click();
+                    const a = document.createElement('a'); a.href = url; a.download = 'MediScan_Clinical_Story.pdf'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 60000);
                 } catch(e) { console.error(e); }
                 finally { btn.innerHTML = '⬇️ PDF'; btn.disabled = false; }
             });
@@ -3592,91 +3596,173 @@ Total Pages Extracted and Analyzed: ${currentFiles.length} of ${currentFiles.len
                     let success = false;
                     let selectedModel = '';
 
-                    // Build the key pool: if user has a custom key, try it first, then fall back to default keys seamlessly
-                    const keyPool = usingCustomKey ? [apiKey, ...DEFAULT_API_KEY_POOL] : DEFAULT_API_KEY_POOL;
+                    // ===== CAPACITY ENGINE =====
+                    // Gemini quotas are counted per Google project AND per model, and the daily quota
+                    // resets at midnight Pacific time. So: (1) when one model's quota runs out we move to the
+                    // next model instead of giving up; (2) per-minute limits are waited out and retried;
+                    // (3) models whose DAILY quota is used up are remembered and skipped until reset;
+                    // (4) several keys (from different Google projects) can be pasted, comma-separated.
+                    const userKeys = usingCustomKey ? apiKey.split(/[\s,;]+/).map(k => k.trim()).filter(Boolean) : [];
+                    const keyPool = [...new Set([...userKeys, ...DEFAULT_API_KEY_POOL].map(k => getDecodedKey(k)).filter(Boolean))];
 
-                    // Active production models supported by Google Gemini API
+                    // Stable models first; newer / lighter models as fallbacks (each has its own separate quota)
                     const MODELS_TO_TRY = [
                         'gemini-2.5-flash',
+                        'gemini-flash-latest',
                         'gemini-3.6-flash',
                         'gemini-3.5-flash',
-                        'gemini-flash-latest'
+                        'gemini-2.5-flash-lite',
+                        'gemini-flash-lite-latest'
                     ];
 
+                    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                    const keyFp = (k) => (k || '').slice(-6);
+                    const loadQuotaMap = () => { try { return JSON.parse(safeStorage.getItem('mediscan_quota_exhausted') || '{}') || {}; } catch (e) { return {}; } };
+                    const saveQuotaMap = (m) => {
+                        const now = Date.now();
+                        Object.keys(m).forEach(k => { if (!m[k] || m[k] < now) delete m[k]; });
+                        try { safeStorage.setItem('mediscan_quota_exhausted', JSON.stringify(m)); } catch (e) {}
+                    };
+                    function nextPacificMidnightMs() {
+                        const now = new Date();
+                        const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).formatToParts(now);
+                        const p = {}; parts.forEach(x => { p[x.type] = x.value; });
+                        const secsIntoDay = (parseInt(p.hour, 10) % 24) * 3600 + parseInt(p.minute, 10) * 60 + parseInt(p.second, 10);
+                        return now.getTime() + (86400 - secsIntoDay) * 1000 + 60000;
+                    }
+                    function parseQuotaError(errorData) {
+                        const err = (errorData && errorData.error) || {};
+                        let retrySec = 0, perDay = false;
+                        (err.details || []).forEach(d => {
+                            if (d && d.retryDelay) retrySec = parseFloat(d.retryDelay) || retrySec;
+                            (d && d.violations || []).forEach(v => {
+                                const id = ((v.quotaId || '') + ' ' + (v.quotaMetric || '')).toLowerCase();
+                                if (id.includes('perday') || id.includes('per_day') || id.includes('requests_per_day')) perDay = true;
+                            });
+                        });
+                        const msg = (err.message || '').toLowerCase();
+                        if (msg.includes('per day') || msg.includes('perday') || msg.includes('daily')) perDay = true;
+                        return { retrySec, perDay };
+                    }
+
+                    let quotaMap = loadQuotaMap();
                     let isRateLimited = false;
                     let isKeyInvalid = false;
+                    let userKeyInvalid = false;
 
-                    // Try every key × every model silently until one succeeds
-                    outer:
-                    for (let ki = 0; ki < keyPool.length && !success; ki++) {
-                        const currentKey = getDecodedKey(keyPool[ki]);
-                        for (let mi = 0; mi < MODELS_TO_TRY.length && !success; mi++) {
-                            const model = MODELS_TO_TRY[mi];
+                    // ---- FAST MODE ----
+                    // Never sit and wait on a busy model: on any limit/error we jump straight to the next
+                    // model/key. The last model that worked is tried FIRST next time, and models that
+                    // don't exist are remembered, so normally the very first request succeeds.
+                    const loadMap = (k) => { try { return JSON.parse(safeStorage.getItem(k) || '{}') || {}; } catch (e) { return {}; } };
+                    const unavailable = loadMap('mediscan_model_unavailable');
+                    const lastGood = safeStorage.getItem('mediscan_last_good_slot') || '';
+                    let candidates = [];
+                    keyPool.forEach(k => MODELS_TO_TRY.forEach(m => candidates.push({ key: k, model: m, slot: keyFp(k) + '|' + m })));
+                    candidates = candidates.filter(c => {
+                        if (quotaMap[c.slot] && quotaMap[c.slot] > Date.now()) { isRateLimited = true; return false; }
+                        if (unavailable[c.model] && unavailable[c.model] > Date.now()) return false;
+                        return true;
+                    });
+                    const lgIdx = candidates.findIndex(c => c.slot === lastGood);
+                    if (lgIdx > 0) candidates.unshift(candidates.splice(lgIdx, 1)[0]);
 
-                            try {
-                                const headers = { 'Content-Type': 'application/json' };
-                                let url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(currentKey)}`;
-                                if (currentKey.startsWith('AQ.') || currentKey.startsWith('ya29.')) {
-                                    headers['Authorization'] = `Bearer ${currentKey}`;
+                    const badKeys = new Set();
+                    let retryLater = []; // models that were only briefly busy (per-minute limit / overload)
+
+                    async function tryCandidate(c) {
+                        let timer = null;
+                        try {
+                            analysisStatus.textContent = `⚡ Analyzing ${currentFiles.length} page(s) via ${c.model}...`;
+                            const headers = { 'Content-Type': 'application/json' };
+                            let url = `https://generativelanguage.googleapis.com/v1beta/models/${c.model}:generateContent?key=${encodeURIComponent(c.key)}`;
+                            if (c.key.startsWith('AQ.') || c.key.startsWith('ya29.')) headers['Authorization'] = `Bearer ${c.key}`;
+
+                            const generationConfig = { temperature: 0.1, topP: 0.85, maxOutputTokens: 32768 };
+                            // Gemini 2.5: switch off the slow "thinking" step — extraction doesn't need it, and it is much faster
+                            if (c.model.startsWith('gemini-2.5')) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+
+                            const controller = new AbortController();
+                            timer = setTimeout(() => controller.abort(), 120000);
+                            const resp = await fetch(url, {
+                                method: 'POST',
+                                headers: headers,
+                                signal: controller.signal,
+                                body: JSON.stringify({
+                                    system_instruction: {
+                                        parts: [{
+                                            text: "You are Spandan Clinical AI, an expert medical diagnostic assistant. Your job is to extract text from all uploaded medical report images page-by-page and provide a comprehensive clinical analysis. You MUST output ALL required sections in exact order. For all diagnostic findings, you MUST strictly classify every parameter/finding into clean markdown tables with explicit status badges: 🟢 Normal or 🔴 High / 🔴 Low / 🔴 Abnormal. Never output unstructured plain text when tables are requested."
+                                        }]
+                                    },
+                                    contents: [{ parts: parts }],
+                                    generationConfig: generationConfig
+                                })
+                            });
+                            clearTimeout(timer);
+                            if (resp.ok) { response = resp; return 'ok'; }
+
+                            const errorData = await resp.json().catch(() => ({}));
+                            lastError = (errorData.error && errorData.error.message) || `HTTP ${resp.status}`;
+                            const lowerErr = lastError.toLowerCase();
+                            console.warn(`${c.model} failed (${resp.status}): ${lastError}`);
+
+                            if (resp.status === 429 || lowerErr.includes('resource_exhausted') || lowerErr.includes('quota')) {
+                                isRateLimited = true;
+                                const q = parseQuotaError(errorData);
+                                if (q.perDay) {
+                                    quotaMap[c.slot] = nextPacificMidnightMs();
+                                    saveQuotaMap(quotaMap);
+                                    return 'next';
                                 }
-
-                                response = await fetch(url, {
-                                    method: 'POST',
-                                    headers: headers,
-                                    body: JSON.stringify({
-                                        system_instruction: {
-                                            parts: [{
-                                                text: "You are Spandan Clinical AI, an expert medical diagnostic assistant. Your job is to extract text from all uploaded medical report images page-by-page and provide a comprehensive clinical analysis. You MUST output ALL required sections in exact order. For all diagnostic findings, you MUST strictly classify every parameter/finding into clean markdown tables with explicit status badges: 🟢 Normal or 🔴 High / 🔴 Low / 🔴 Abnormal. Never output unstructured plain text when tables are requested."
-                                            }]
-                                        },
-                                        contents: [{ parts: parts }],
-                                        generationConfig: {
-                                            temperature: 0.1,
-                                            topP: 0.85,
-                                            maxOutputTokens: 8192
-                                        }
-                                    })
-                                });
-
-                                if (response.ok) {
-                                    success = true;
-                                    selectedModel = model;
-                                    break outer;
-                                }
-
-                                const errorData = await response.json().catch(() => ({}));
-                                lastError = (errorData.error && errorData.error.message) || `HTTP ${response.status}`;
-                                console.warn(`Key[${ki}] ${model} failed (${response.status}): ${lastError}`);
-
-                                const lowerErr = lastError.toLowerCase();
-                                const isKeyErr = response.status === 400 || response.status === 401 || response.status === 403 ||
-                                                 lowerErr.includes('key') || lowerErr.includes('unauthenticated') || 
-                                                 lowerErr.includes('invalid') || lowerErr.includes('leaked') || lowerErr.includes('permission');
-
-                                if (isKeyErr) {
-                                    isKeyInvalid = true;
-                                    break; // Stop model loop for invalid key immediately
-                                }
-
-                                if (response.status === 429 || lowerErr.includes('quota') || lowerErr.includes('rate limit') || lowerErr.includes('resource_exhausted')) {
-                                    isRateLimited = true;
-                                    break; // Stop model loop for rate-limited key immediately
-                                }
-
-                                // Model not available — skip to next model
-                                if (response.status === 404 || lowerErr.includes('not found') || lowerErr.includes('does not exist')) {
-                                    continue;
-                                }
-
-                            } catch (err) {
-                                if (err.message && err.message.startsWith('❌')) throw err;
-                                lastError = err.message || 'Network error';
-                                console.warn(`Fetch error Key[${ki}] ${model}: ${lastError}`);
+                                c.readyAt = Date.now() + Math.min(Math.max(Math.ceil(q.retrySec) || 10, 2), 60) * 1000;
+                                return 'busy';
                             }
-
-                            // Small silent gap between model attempts
-                            await new Promise(r => setTimeout(r, 150));
+                            if (resp.status === 401 || resp.status === 403 || lowerErr.includes('api key') || lowerErr.includes('api_key') || lowerErr.includes('leaked') || lowerErr.includes('unauthenticated')) {
+                                isKeyInvalid = true;
+                                badKeys.add(c.key);
+                                if (userKeys.map(getDecodedKey).includes(c.key)) userKeyInvalid = true;
+                                return 'next';
+                            }
+                            if (resp.status === 404 || lowerErr.includes('not found') || lowerErr.includes('is not supported')) {
+                                unavailable[c.model] = Date.now() + 24 * 3600 * 1000; // don't waste time on it for a day
+                                try { safeStorage.setItem('mediscan_model_unavailable', JSON.stringify(unavailable)); } catch (e) {}
+                                return 'next';
+                            }
+                            if (resp.status >= 500) { c.readyAt = Date.now() + 2000; return 'busy'; }
+                            return 'next';
+                        } catch (err) {
+                            if (timer) clearTimeout(timer);
+                            lastError = (err && err.name === 'AbortError') ? 'Request timed out' : ((err && err.message) || 'Network error');
+                            console.warn(`Fetch error ${c.model}: ${lastError}`);
+                            c.readyAt = Date.now() + 1000;
+                            return 'busy';
                         }
+                    }
+
+                    // Pass 1: go down the list without any waiting
+                    for (const c of candidates) {
+                        if (badKeys.has(c.key)) continue;
+                        const r = await tryCandidate(c);
+                        if (r === 'ok') { success = true; selectedModel = c.model; break; }
+                        if (r === 'busy') retryLater.push(c);
+                    }
+                    // Pass 2 (only if EVERY option was briefly busy): wait just for the soonest one, then retry
+                    if (!success && retryLater.length) {
+                        retryLater = retryLater.filter(c => !badKeys.has(c.key)).sort((a, b) => a.readyAt - b.readyAt);
+                        for (const c of retryLater) {
+                            let waitMs = c.readyAt - Date.now();
+                            while (waitMs > 0) {
+                                analysisStatus.textContent = `⏳ All models momentarily busy — retrying in ${Math.ceil(waitMs / 1000)}s...`;
+                                await sleep(Math.min(1000, waitMs));
+                                waitMs = c.readyAt - Date.now();
+                            }
+                            const r = await tryCandidate(c);
+                            if (r === 'ok') { success = true; selectedModel = c.model; break; }
+                        }
+                    }
+                    if (success) {
+                        const okC = candidates.find(c => c.model === selectedModel && !badKeys.has(c.key));
+                        if (okC) { try { safeStorage.setItem('mediscan_last_good_slot', okC.slot); } catch (e) {} }
                     }
 
                     if (!success) {
@@ -3686,29 +3772,43 @@ Total Pages Extracted and Analyzed: ${currentFiles.length} of ${currentFiles.len
                                 apiConfigDetails.closest('.config-section').style.display = 'block';
                             }
                         }
-                        if (isKeyInvalid) {
-                            safeStorage.removeItem('mediscan_gemini_api_key');
-                            if (keyStatus) {
-                                keyStatus.innerHTML = `❌ <strong>API Key Invalid or Revoked:</strong> The saved key was invalid. Cleared saved key to use new default key. Please try again! (<a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" style="color: #60a5fa; text-decoration: underline;">Google AI Studio</a>)`;
-                                keyStatus.style.color = "var(--danger-color)";
-                            }
-                            throw new Error('❌ The saved Gemini API key was invalid or revoked. It has been cleared. Please tap "Done! Extract & Analyze" again!');
-                        }
                         if (isRateLimited) {
+                            const resetAt = new Date(nextPacificMidnightMs()).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit' });
                             if (keyStatus) {
-                                keyStatus.innerHTML = `⚠️ <strong>Default Key Quota Exhausted:</strong> The shared key has hit Google Gemini's rate limit. Please paste your own free API key above! (<a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" style="color: #60a5fa; text-decoration: underline;">Get free key from Google AI Studio</a>)`;
+                                keyStatus.innerHTML = `⚠️ <strong>Daily free quota used up</strong> on all available models/keys. It resets at about <strong>${resetAt}</strong> (your time). To keep working now, paste a key from another Google project (several keys can be pasted, separated by commas), or enable billing on your key for no daily cap. (<a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" style="color: #60a5fa; text-decoration: underline;">Google AI Studio</a>)`;
                                 keyStatus.style.color = "var(--danger-color)";
                             }
-                            throw new Error('⚠️ The API key quota has been exhausted (HTTP 429). Please enter your own free Gemini API key in the settings panel above to analyze your report.');
+                            throw new Error(`⚠️ Today's free Gemini quota is used up on every model tried. It resets at about ${resetAt}. Add another key or enable billing to continue now.`);
+                        }
+                        if (isKeyInvalid) {
+                            if (userKeyInvalid) safeStorage.removeItem('mediscan_gemini_api_key');
+                            if (keyStatus) {
+                                keyStatus.innerHTML = `❌ <strong>API Key Invalid or Revoked.</strong> Please create a new key in <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" style="color: #60a5fa; text-decoration: underline;">Google AI Studio</a> and paste it above.`;
+                                keyStatus.style.color = "var(--danger-color)";
+                            }
+                            throw new Error('❌ The Gemini API key was rejected (invalid or revoked). Please paste a new key in the settings panel above.');
                         }
                         throw new Error(`Unable to connect to AI service: ${lastError}`);
                     }
 
+                    // Daily usage counter (counts by Google's quota day)
+                    let reportsToday = 1;
+                    try {
+                        const quotaDay = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(new Date());
+                        const stored = JSON.parse(safeStorage.getItem('mediscan_daily_count') || '{}') || {};
+                        reportsToday = (stored.day === quotaDay ? (stored.count || 0) : 0) + 1;
+                        safeStorage.setItem('mediscan_daily_count', JSON.stringify({ day: quotaDay, count: reportsToday }));
+                    } catch (e) {}
 
                     const data = await response.json();
                     let textContent = "";
                     if (data && data.candidates && data.candidates.length > 0 && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts.length > 0) {
                         textContent = data.candidates[0].content.parts[0].text || "";
+                    }
+
+                    const finishReason = data && data.candidates && data.candidates[0] && data.candidates[0].finishReason;
+                    if (textContent && finishReason === 'MAX_TOKENS') {
+                        console.warn('Response was cut short (MAX_TOKENS). Fewer pages per job will give a complete report.');
                     }
 
                     if (!textContent) {
@@ -3865,11 +3965,12 @@ Total Pages Extracted and Analyzed: ${currentFiles.length} of ${currentFiles.len
                     // Ensure target card is visible and others hidden
                     selectLanguageByCode(currentSelectedLangCode);
 
-                    analysisStatus.textContent = `✅ Extracted & analyzed all ${currentFiles.length} page(s) via ${selectedModel}! Switch tabs to view Clinical Story or Patient Summary in English, Marathi, Kannada, or Hindi!`;
+                    analysisStatus.textContent = `✅ Extracted & analyzed all ${currentFiles.length} page(s) via ${selectedModel} (report #${reportsToday} today)${finishReason === 'MAX_TOKENS' ? ' ⚠️ Output was very long and may be cut short — try fewer pages per job.' : ''}! Switch tabs to view Clinical Story or Patient Summary in English, Marathi, Kannada, or Hindi!`;
                     downloadActions.classList.remove('hidden');
 
                     // Background auto PDF pre-generation of BOTH Structured Report and Patient Summary PDFs
-                    setTimeout(async () => {
+                    const runWhenIdle = (fn) => (window.requestIdleCallback ? window.requestIdleCallback(fn, { timeout: 4000 }) : setTimeout(fn, 1500));
+                    runWhenIdle(async () => {
                         try {
                             window.autoStructuredPdfBlob = await generateSectionPdfBlob('📊 Structured Clinical Report', '#3b82f6', 'analysisResult', 'MediScan_Structured_Report.pdf');
                             let activeCardId = 'summaryCardEn';
@@ -3883,7 +3984,7 @@ Total Pages Extracted and Analyzed: ${currentFiles.length} of ${currentFiles.len
                         } catch(e) {
                             console.warn("Auto PDF pre-generation notice:", e);
                         }
-                    }, 400);
+                    });
 
                 } catch (error) {
                     console.error("AI Analysis Error:", error);
